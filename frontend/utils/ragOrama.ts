@@ -1,0 +1,1587 @@
+import { create, insert, search } from "@orama/orama";
+import { embedTexts, type EmbeddingProvider } from "@/utils/embeddingClient";
+import { normalizeSearchText } from "@/utils/textExtractor";
+import { getShelbyBlobUrl } from "@/utils/shelbyConfig";
+import type { ChunkRecord, DocumentManifest, DocumentReplacement, MetadataValue, PageRecord, PortableRagPackage, RetrievalResult, StoryEntry } from "@/utils/ragTypes";
+import { getGeminiUsagePreferences } from "@/utils/geminiUsage";
+import { isRagArtifactName } from "@/utils/hotRag";
+import { sha256Text } from "@/utils/contentIntegrity";
+import { localize } from "@/i18n";
+import { sourceContentIdentity } from "@/utils/ragLifecycle";
+import { createShelbyWorkspaceKey, isSupportedShelbyNetwork, parseShelbyWorkspaceKey } from "@/utils/shelbyNetwork";
+
+export type { MetadataValue, DocumentManifest, PageRecord, PortableRagPackage, RetrievalResult, StoryEntry } from "@/utils/ragTypes";
+
+export interface RagSource {
+  source: string;
+  displayName: string;
+  title?: string;
+  titleMetadata?: MetadataValue;
+  aliases: string[];
+  authors: string[];
+  blobUrl?: string;
+  type: "text" | "image" | "video";
+  status: DocumentManifest["status"];
+  chunks: number;
+  pageCount?: number;
+  ocrCoverage: number;
+  textCoverage?: number;
+  accessTag?: DocumentManifest["accessTag"];
+  embeddingStatus: DocumentManifest["embeddingStatus"];
+  embeddingProvider?: DocumentManifest["embeddingProvider"];
+  revision: string;
+  indexedAt: number;
+  error?: string;
+  lastAttemptAt?: number;
+  lastAttemptRevision?: string;
+  lastAttemptError?: string;
+}
+
+interface ShelbyInventoryRecord {
+  names: string[];
+  eligibleNames?: string[];
+  /** Policies that could not be verified in the latest otherwise-successful refresh. */
+  unresolvedNames?: string[];
+  fetchedAt: number;
+  verified?: boolean;
+}
+
+interface WorkspaceRecord {
+  id: string;
+  owner: string;
+  inventory: ShelbyInventoryRecord | null;
+  stories: StoryEntry[];
+}
+
+const DB_NAME = "shelby-rag-explorer-v5";
+const DB_VERSION = 1;
+const LEGACY_V4_DB_NAME = "shelby-rag-explorer-v4";
+const LEGACY_V4_MIGRATION_MARKER = "__migration_v4_to_testnet__";
+let databasePromise: Promise<IDBDatabase | null> | null = null;
+let activeOwner: string | null = null;
+const manifests = new Map<string, DocumentManifest>();
+const pages = new Map<string, PageRecord>();
+const chunks = new Map<string, ChunkRecord>();
+let workspace: WorkspaceRecord | null = null;
+let lexicalDb: any = null;
+let contentLoaded = false;
+const queryEmbeddingCache = new Map<string, number[]>();
+let ownerSwitch = Promise.resolve();
+export interface RemoteRagProvider {
+  id: string;
+  /** Legacy single-file snapshot loader. New Hot RAG providers search shards directly. */
+  load?: (signal?: AbortSignal) => Promise<PortableRagPackage | null>;
+  search?: (query: string, limit: number, signal?: AbortSignal, excludeSources?: Set<string>) => Promise<RetrievalResult[]>;
+  lookupExactQuote?: (quote: string, signal?: AbortSignal) => Promise<RetrievalResult | null>;
+  getPageRecord?: (documentId: string, pageNumber: number) => PageRecord | undefined;
+  mode?: "legacy" | "hot";
+  cacheTtlMs?: number;
+}
+let remoteRagProvider: RemoteRagProvider | null = null;
+let remoteRagCache: { providerId: string; packageData: PortableRagPackage; loadedAt: number } | null = null;
+
+function emitRagState() {
+  if (typeof window !== "undefined") window.dispatchEvent(new Event("shelby:rag-state"));
+}
+
+function clearActiveWorkspaceState(emit = true) {
+  activeOwner = null;
+  manifests.clear();
+  pages.clear();
+  chunks.clear();
+  workspace = null;
+  lexicalDb = null;
+  contentLoaded = false;
+  queryEmbeddingCache.clear();
+  remoteRagProvider = null;
+  remoteRagCache = null;
+  if (emit) emitRagState();
+}
+
+/**
+ * `eligibleNames` is written only after a successful Shelby inventory + policy
+ * refresh. Older workspaces intentionally fall back to their previous behavior
+ * until the first authoritative refresh migrates them.
+ */
+function isSourceEligibleInCurrentInventory(source: string): boolean {
+  const eligibleNames = workspace?.inventory?.eligibleNames;
+  return !Array.isArray(eligibleNames) || eligibleNames.includes(source);
+}
+
+function isSearchableManifest(manifest: DocumentManifest): boolean {
+  return manifest.status === "indexed" && isSourceEligibleInCurrentInventory(manifest.source);
+}
+
+/** Registers the current wallet's newest Shelby snapshot as an on-demand search source. */
+export function setRemoteRagProvider(provider: RemoteRagProvider | null) {
+  const changed = remoteRagProvider?.id !== provider?.id;
+  remoteRagProvider = provider;
+  if (changed) remoteRagCache = null;
+  emitRagState();
+}
+
+export function hasRemoteRagProvider(): boolean {
+  return Boolean(remoteRagProvider);
+}
+
+export function isHotRemoteRagProvider(): boolean {
+  return remoteRagProvider?.mode === "hot";
+}
+
+export function primeRemoteRagPackage(providerId: string, packageData: PortableRagPackage) {
+  if (remoteRagProvider?.id !== providerId) return;
+  remoteRagCache = { providerId, packageData, loadedAt: Date.now() };
+  emitRagState();
+}
+
+async function getRemoteRagPackage(signal?: AbortSignal): Promise<PortableRagPackage | null> {
+  signal?.throwIfAborted();
+  const provider = remoteRagProvider;
+  if (!provider?.load) return null;
+  const ttl = provider.cacheTtlMs ?? 60_000;
+  if (remoteRagCache?.providerId === provider.id && Date.now() - remoteRagCache.loadedAt < ttl) return remoteRagCache.packageData;
+  const packageData = await provider.load(signal);
+  signal?.throwIfAborted();
+  if (packageData && remoteRagProvider?.id === provider.id) remoteRagCache = { providerId: provider.id, packageData, loadedAt: Date.now() };
+  return packageData;
+}
+
+function requestValue<T>(request: IDBRequest<T>): Promise<T> {
+  return new Promise((resolve, reject) => {
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+}
+
+function transactionDone(transaction: IDBTransaction): Promise<void> {
+  return new Promise((resolve, reject) => {
+    transaction.oncomplete = () => resolve();
+    transaction.onerror = () => reject(transaction.error);
+    transaction.onabort = () => reject(transaction.error ?? new Error(localize("The browser database operation was cancelled.", "Thao tác cơ sở dữ liệu trình duyệt đã bị huỷ.")));
+  });
+}
+
+async function openExistingDatabase(name: string): Promise<IDBDatabase | null> {
+  return new Promise((resolve) => {
+    const request = indexedDB.open(name);
+    request.onupgradeneeded = () => request.transaction?.abort();
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => resolve(null);
+    request.onblocked = () => resolve(null);
+  });
+}
+
+function legacyTestnetOwner(owner: string): string {
+  const parsed = parseShelbyWorkspaceKey(owner);
+  return createShelbyWorkspaceKey({ network: "testnet", owner: parsed.owner });
+}
+
+function migrateLegacyId(value: unknown, previousOwner: string, nextOwner: string): unknown {
+  if (typeof value !== "string") return value;
+  return value.startsWith(`${previousOwner}:`) ? `${nextOwner}${value.slice(previousOwner.length)}` : value;
+}
+
+async function migrateV4IntoTestnet(db: IDBDatabase) {
+  const marker = await requestValue(db.transaction("workspace", "readonly").objectStore("workspace").get(LEGACY_V4_MIGRATION_MARKER));
+  if (marker) return;
+  const legacy = await openExistingDatabase(LEGACY_V4_DB_NAME);
+  if (!legacy || !["manifests", "pages", "chunks", "workspace"].every((store) => legacy.objectStoreNames.contains(store))) {
+    legacy?.close();
+    const tx = db.transaction("workspace", "readwrite");
+    tx.objectStore("workspace").put({ id: LEGACY_V4_MIGRATION_MARKER, migratedAt: Date.now() });
+    await transactionDone(tx);
+    return;
+  }
+  try {
+    const read = legacy.transaction(["manifests", "pages", "chunks", "workspace"], "readonly");
+    const readDone = transactionDone(read);
+    const [legacyManifests, legacyPages, legacyChunks, legacyWorkspaces] = await Promise.all([
+      requestValue(read.objectStore("manifests").getAll()) as Promise<any[]>,
+      requestValue(read.objectStore("pages").getAll()) as Promise<any[]>,
+      requestValue(read.objectStore("chunks").getAll()) as Promise<any[]>,
+      requestValue(read.objectStore("workspace").getAll()) as Promise<any[]>,
+    ]);
+    await readDone;
+    const write = db.transaction(["manifests", "pages", "chunks", "workspace"], "readwrite");
+    for (const record of legacyManifests) {
+      if (!record?.owner) continue;
+      const nextOwner = legacyTestnetOwner(record.owner);
+      write.objectStore("manifests").put({ ...record, owner: nextOwner, id: migrateLegacyId(record.id, record.owner, nextOwner) });
+    }
+    for (const record of legacyPages) {
+      if (!record?.owner) continue;
+      const nextOwner = legacyTestnetOwner(record.owner);
+      write.objectStore("pages").put({
+        ...record,
+        owner: nextOwner,
+        id: migrateLegacyId(record.id, record.owner, nextOwner),
+        documentId: migrateLegacyId(record.documentId, record.owner, nextOwner),
+      });
+    }
+    for (const record of legacyChunks) {
+      if (!record?.owner) continue;
+      const nextOwner = legacyTestnetOwner(record.owner);
+      write.objectStore("chunks").put({
+        ...record,
+        owner: nextOwner,
+        id: migrateLegacyId(record.id, record.owner, nextOwner),
+        documentId: migrateLegacyId(record.documentId, record.owner, nextOwner),
+      });
+    }
+    for (const record of legacyWorkspaces) {
+      if (!record?.owner || record.id === LEGACY_V4_MIGRATION_MARKER) continue;
+      const nextOwner = legacyTestnetOwner(record.owner);
+      write.objectStore("workspace").put({ ...record, owner: nextOwner, id: nextOwner });
+    }
+    write.objectStore("workspace").put({ id: LEGACY_V4_MIGRATION_MARKER, migratedAt: Date.now() });
+    await transactionDone(write);
+  } finally {
+    legacy.close();
+  }
+}
+
+function openDatabase(): Promise<IDBDatabase | null> {
+  if (typeof indexedDB === "undefined") return Promise.resolve(null);
+  if (databasePromise) return databasePromise;
+  databasePromise = new Promise<IDBDatabase>((resolve, reject) => {
+    const request = indexedDB.open(DB_NAME, DB_VERSION);
+    request.onupgradeneeded = () => {
+      const db = request.result;
+      const manifestStore = db.createObjectStore("manifests", { keyPath: "id" });
+      manifestStore.createIndex("owner", "owner");
+      manifestStore.createIndex("ownerSource", ["owner", "source"], { unique: true });
+      const pageStore = db.createObjectStore("pages", { keyPath: "id" });
+      pageStore.createIndex("owner", "owner");
+      pageStore.createIndex("documentId", "documentId");
+      const chunkStore = db.createObjectStore("chunks", { keyPath: "id" });
+      chunkStore.createIndex("owner", "owner");
+      chunkStore.createIndex("documentId", "documentId");
+      db.createObjectStore("workspace", { keyPath: "id" });
+    };
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  }).then(async (db) => {
+    try {
+      await migrateV4IntoTestnet(db);
+    } catch (error) {
+      // A damaged legacy database must not make the current v5 workspace
+      // unusable. The marker is written only after a successful transaction,
+      // so the migration can be retried on the next page load.
+      console.warn("Could not migrate the legacy Testnet RAG database.", error);
+    }
+    return db;
+  });
+  return databasePromise;
+}
+
+async function readOwnerRecords<T>(storeName: "manifests" | "pages" | "chunks", owner: string): Promise<T[]> {
+  const db = await openDatabase();
+  if (!db) return [];
+  const transaction = db.transaction(storeName, "readonly");
+  return requestValue(transaction.objectStore(storeName).index("owner").getAll(owner)) as Promise<T[]>;
+}
+
+/** Checks persisted records without activating or hydrating another network workspace. */
+export async function hasPersistedRagWorkspace(owner: string): Promise<boolean> {
+  const normalized = owner.toLowerCase();
+  if (!normalized) return false;
+  const db = await openDatabase();
+  if (!db) return false;
+  const transaction = db.transaction("manifests", "readonly");
+  const count = await requestValue(transaction.objectStore("manifests").index("owner").count(normalized));
+  return count > 0;
+}
+
+async function migrateLegacyState(owner: string) {
+  if (typeof indexedDB === "undefined" || manifests.size) return;
+  const identity = parseShelbyWorkspaceKey(owner);
+  if (identity.network !== "testnet") return;
+  const legacy = await openExistingDatabase("shelby-rag-explorer");
+  if (!legacy) return;
+  if (!legacy.objectStoreNames.contains("state")) {
+    legacy.close();
+    return;
+  }
+  try {
+    const transaction = legacy.transaction("state", "readonly");
+    const state: any = await requestValue(transaction.objectStore("state").get("orama-v2"));
+    const legacyOwner = state?.activeRagOwner?.toLowerCase();
+    if (!state || legacyOwner !== identity.owner) return;
+    const migrated: DocumentManifest[] = (state.sources ?? []).map((source: any) => ({
+      id: `${owner}:${source.source}`,
+      owner,
+      source: source.source,
+      displayName: source.displayName ?? source.source,
+      revision: "legacy-v3",
+      blobUrl: source.blobUrl,
+      mimeType: source.type === "image" ? "image/*" : "application/pdf",
+      type: source.type ?? "text",
+      aliases: [],
+      authors: [],
+      pageCount: source.pageCount ?? 0,
+      chunkCount: 0,
+      ocrCoverage: 0,
+      embeddingStatus: "unavailable",
+      status: "upgrade_required",
+      indexedAt: source.indexedAt ?? Date.now(),
+      error: localize("This old index has no page-level data. Process the document again.", "Chỉ mục cũ không có dữ liệu theo trang; hãy nạp lại tài liệu một lần."),
+    }));
+    const db = await openDatabase();
+    if (!db) return;
+    const write = db.transaction(["manifests", "workspace"], "readwrite");
+    migrated.forEach((manifest) => write.objectStore("manifests").put(manifest));
+    const migratedWorkspace: WorkspaceRecord = {
+      id: owner,
+      owner,
+      inventory: state.blobInventory?.owner?.toLowerCase() === identity.owner ? { names: state.blobInventory.names ?? [], fetchedAt: state.blobInventory.fetchedAt ?? Date.now() } : null,
+      stories: [],
+    };
+    write.objectStore("workspace").put(migratedWorkspace);
+    await transactionDone(write);
+    migrated.forEach((manifest) => manifests.set(manifest.source, manifest));
+    workspace = migratedWorkspace;
+  } finally {
+    legacy.close();
+  }
+}
+
+async function loadOwner(owner: string) {
+  manifests.clear();
+  pages.clear();
+  chunks.clear();
+  lexicalDb = null;
+  contentLoaded = false;
+  const storedManifests = await readOwnerRecords<DocumentManifest>("manifests", owner);
+  storedManifests.forEach((manifest) => manifests.set(manifest.source, manifest));
+  const db = await openDatabase();
+  workspace = db ? await requestValue(db.transaction("workspace", "readonly").objectStore("workspace").get(owner)) ?? null : null;
+  await migrateLegacyState(owner);
+}
+
+async function ensureContentLoaded() {
+  await ownerSwitch;
+  const contentOwner = activeOwner;
+  if (contentLoaded || !contentOwner) return;
+  const [storedPages, storedChunks] = await Promise.all([
+    readOwnerRecords<PageRecord>("pages", contentOwner),
+    readOwnerRecords<ChunkRecord>("chunks", contentOwner),
+  ]);
+  if (activeOwner !== contentOwner) {
+    await ownerSwitch;
+    return ensureContentLoaded();
+  }
+  pages.clear();
+  chunks.clear();
+  storedPages.forEach((page) => pages.set(page.id, page));
+  storedChunks.forEach((chunk) => chunks.set(chunk.id, chunk));
+  contentLoaded = true;
+}
+
+export async function setActiveRagOwner(owner: string, shouldActivate: () => boolean = () => true): Promise<boolean> {
+  const normalized = owner.toLowerCase();
+  let activated = false;
+  ownerSwitch = ownerSwitch.then(async () => {
+    if (!shouldActivate()) return;
+    if (activeOwner === normalized) {
+      activated = true;
+      return;
+    }
+    // Change the authority before hydration starts. Any in-flight write for the
+    // previous wallet can still finish its owner-keyed IndexedDB transaction,
+    // but must not mutate the new wallet's in-memory workspace afterwards.
+    activeOwner = normalized;
+    queryEmbeddingCache.clear();
+    await loadOwner(normalized);
+    if (!shouldActivate() && activeOwner === normalized) {
+      // A wallet/request can become stale while IndexedDB is hydrating. Do not
+      // leave that old owner authoritative until another component switches it.
+      clearActiveWorkspaceState(true);
+      return;
+    }
+    activated = activeOwner === normalized;
+  });
+  await ownerSwitch;
+  return activated && shouldActivate();
+}
+
+/**
+ * Drops the active wallet authority and every hydrated search object without
+ * deleting that wallet's persisted IndexedDB records. `expectedOwner` makes a
+ * late disconnect cleanup harmless after another wallet has already connected.
+ */
+export async function deactivateActiveRagOwner(expectedOwner?: string): Promise<boolean> {
+  const normalizedExpectedOwner = expectedOwner?.toLowerCase();
+  let deactivated = false;
+  ownerSwitch = ownerSwitch.then(async () => {
+    if (normalizedExpectedOwner && activeOwner !== normalizedExpectedOwner) return;
+    clearActiveWorkspaceState(true);
+    deactivated = true;
+  });
+  await ownerSwitch;
+  return deactivated;
+}
+
+/** Compatibility name retained for existing callers; v4 hydrates only persisted records here. */
+export async function getVectorDB() {
+  await ownerSwitch;
+  if (activeOwner && !workspace) await loadOwner(activeOwner);
+  return null;
+}
+
+function asRagSource(manifest: DocumentManifest): RagSource {
+  return {
+    source: manifest.source,
+    displayName: manifest.displayName,
+    title: manifest.title?.value,
+    titleMetadata: manifest.title,
+    aliases: manifest.aliases,
+    authors: manifest.authors,
+    blobUrl: manifest.blobUrl,
+    type: manifest.type,
+    status: manifest.status,
+    chunks: manifest.chunkCount,
+    pageCount: manifest.pageCount || undefined,
+    ocrCoverage: manifest.ocrCoverage,
+    textCoverage: manifest.textCoverage,
+    accessTag: manifest.accessTag,
+    embeddingStatus: manifest.embeddingStatus,
+    embeddingProvider: manifest.embeddingProvider,
+    revision: manifest.revision,
+    indexedAt: manifest.indexedAt,
+    error: manifest.error,
+    lastAttemptAt: manifest.lastAttemptAt,
+    lastAttemptRevision: manifest.lastAttemptRevision,
+    lastAttemptError: manifest.lastAttemptError,
+  };
+}
+
+export function getRagSources(): RagSource[] {
+  return Array.from(manifests.values()).map(asRagSource);
+}
+
+export function getDocumentManifests(): DocumentManifest[] {
+  return Array.from(manifests.values());
+}
+
+export async function exportPortableRagPackage(options: { includeEmbeddings?: boolean; exportedAt?: number } = {}): Promise<PortableRagPackage> {
+  if (!activeOwner) throw new Error(localize("Connect a wallet before creating a RAG backup.", "Hãy kết nối ví trước khi đóng gói RAG."));
+  await ensureContentLoaded();
+  const sourceIdentity = parseShelbyWorkspaceKey(activeOwner);
+  const documents = Array.from(manifests.values()).filter(isSearchableManifest).map((manifest) => {
+    const documentPages = Array.from(pages.values()).filter((page) => page.documentId === manifest.id).map(({ owner: _owner, id: _id, documentId: _documentId, ...page }) => page);
+    const documentChunks = Array.from(chunks.values()).filter((chunk) => chunk.documentId === manifest.id).map(({ owner: _owner, id: _id, documentId: _documentId, ...chunk }) => {
+      if (options.includeEmbeddings) return chunk;
+      const { embedding: _embedding, ...withoutEmbedding } = chunk;
+      return withoutEmbedding;
+    });
+    const documentStories = (workspace?.stories ?? []).filter((story) => story.source === manifest.source);
+    const { owner, id: _id, revision, embeddingStatus: _embeddingStatus, indexedAt, ...portableManifest } = manifest;
+    return { manifest: { ...portableManifest, originalSourceOwner: parseShelbyWorkspaceKey(owner).owner, sourceRevision: revision, sourceIndexedAt: indexedAt }, pages: documentPages, chunks: documentChunks, stories: documentStories };
+  });
+  const inventory = workspace?.inventory
+    ? {
+        fetchedAt: workspace.inventory.fetchedAt,
+        names: (workspace.inventory.eligibleNames ?? workspace.inventory.names).filter((name) => !isRagArtifactName(name)),
+      }
+    : undefined;
+  const exportedAt = Number.isSafeInteger(options.exportedAt) && Number(options.exportedAt) > 0 ? Number(options.exportedAt) : Date.now();
+  return {
+    format: "shelby-rag-package",
+    version: 2,
+    sourceNetwork: sourceIdentity.network,
+    exportedAt,
+    sourceOwner: sourceIdentity.owner,
+    inventory,
+    documents,
+  };
+}
+
+export function isPortableRagPackage(value: unknown): value is PortableRagPackage {
+  if (!value || typeof value !== "object") return false;
+  const candidate = value as Partial<PortableRagPackage>;
+  return candidate.format === "shelby-rag-package"
+    && (candidate.version === 1 || candidate.version === 2)
+    && (candidate.version === 1 || isSupportedShelbyNetwork(candidate.sourceNetwork))
+    && Number.isSafeInteger(candidate.exportedAt)
+    && Number(candidate.exportedAt) > 0
+    && typeof candidate.sourceOwner === "string"
+    && candidate.sourceOwner.length > 0
+    && Array.isArray(candidate.documents)
+    && candidate.documents.length <= 512;
+}
+
+const MAX_PORTABLE_PAGES = 100_000;
+const MAX_PORTABLE_CHUNKS = 100_000;
+const MAX_PORTABLE_TEXT_CHARACTERS = 96 * 1024 * 1024;
+
+function isFiniteNonNegative(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0;
+}
+
+function isSafePositiveInteger(value: unknown): value is number {
+  return Number.isSafeInteger(value) && Number(value) > 0;
+}
+
+function isBoundedText(value: unknown, maxLength: number): value is string {
+  return typeof value === "string" && value.length <= maxLength;
+}
+
+function portablePackageError(): Error {
+  return new Error(localize(
+    "This Shelby RAG backup is malformed or exceeds the safe import limit.",
+    "Gói Shelby RAG bị lỗi cấu trúc hoặc vượt giới hạn nhập an toàn.",
+  ));
+}
+
+/** Validate and materialize every document before opening a write transaction. */
+function preparePortableReplacements(packageData: PortableRagPackage, importOwner: string): DocumentReplacement[] {
+  const replacements: DocumentReplacement[] = [];
+  const sources = new Set<string>();
+  let totalPages = 0;
+  let totalChunks = 0;
+  let totalTextCharacters = 0;
+
+  for (const portable of packageData.documents) {
+    const manifest = portable?.manifest;
+    if (
+      !manifest
+      || !isBoundedText(manifest.source, 512)
+      || !manifest.source.trim()
+      || !isBoundedText(manifest.displayName, 512)
+      || !isBoundedText(manifest.mimeType, 256)
+      || (manifest.type !== "text" && manifest.type !== "image" && manifest.type !== "video")
+      || !Array.isArray(manifest.aliases)
+      || !manifest.aliases.every((value) => isBoundedText(value, 512))
+      || !Array.isArray(manifest.authors)
+      || !manifest.authors.every((value) => isBoundedText(value, 512))
+      || !isFiniteNonNegative(manifest.pageCount)
+      || !isFiniteNonNegative(manifest.chunkCount)
+      || !isFiniteNonNegative(manifest.ocrCoverage)
+      || !Array.isArray(portable.pages)
+      || !Array.isArray(portable.chunks)
+      || !Array.isArray(portable.stories)
+      || sources.has(manifest.source)
+    ) throw portablePackageError();
+    sources.add(manifest.source);
+    totalPages += portable.pages.length;
+    totalChunks += portable.chunks.length;
+    if (totalPages > MAX_PORTABLE_PAGES || totalChunks > MAX_PORTABLE_CHUNKS) throw portablePackageError();
+
+    const documentId = `${importOwner}:${manifest.source}`;
+    const pageNumbers = new Set<number>();
+    const pageRecords: PageRecord[] = portable.pages.map((page) => {
+      if (
+        page?.source !== manifest.source
+        || !isBoundedText(page.displayName, 512)
+        || !isSafePositiveInteger(page.pageNumber)
+        || !isSafePositiveInteger(page.totalPages)
+        || page.pageNumber > page.totalPages
+        || !isBoundedText(page.rawText, MAX_PORTABLE_TEXT_CHARACTERS)
+        || !isBoundedText(page.normalizedText, MAX_PORTABLE_TEXT_CHARACTERS)
+        || !["text_layer", "local_ocr", "cloud_vision", "cloud_video", "mixed"].includes(page.extractionMethod)
+        || pageNumbers.has(page.pageNumber)
+      ) throw portablePackageError();
+      pageNumbers.add(page.pageNumber);
+      totalTextCharacters += page.rawText.length + page.normalizedText.length;
+      if (totalTextCharacters > MAX_PORTABLE_TEXT_CHARACTERS) throw portablePackageError();
+      return { ...page, id: `${documentId}:page:${page.pageNumber}`, owner: importOwner, documentId };
+    });
+
+    const chunkRecords: ChunkRecord[] = portable.chunks.map((chunk, index) => {
+      if (
+        chunk?.source !== manifest.source
+        || !isBoundedText(chunk.displayName, 512)
+        || (chunk.type !== "text" && chunk.type !== "image" && chunk.type !== "video")
+        || !isBoundedText(chunk.text, MAX_PORTABLE_TEXT_CHARACTERS)
+        || !isBoundedText(chunk.normalizedText, MAX_PORTABLE_TEXT_CHARACTERS)
+        || !isSafePositiveInteger(chunk.pageNumber)
+        || !isSafePositiveInteger(chunk.totalPages)
+        || chunk.pageNumber > chunk.totalPages
+        || (chunk.embedding !== undefined && (!Array.isArray(chunk.embedding) || chunk.embedding.length > 4_096 || chunk.embedding.some((value) => !Number.isFinite(value))))
+      ) throw portablePackageError();
+      totalTextCharacters += chunk.text.length + chunk.normalizedText.length;
+      if (totalTextCharacters > MAX_PORTABLE_TEXT_CHARACTERS) throw portablePackageError();
+      return { ...chunk, id: `${documentId}:chunk:${index}`, owner: importOwner, documentId };
+    });
+
+    if (portable.stories.some((story) => (
+      story?.source !== manifest.source
+      || !isFiniteNonNegative(story.number)
+      || !isBoundedText(story.title, 1_000)
+      || !isSafePositiveInteger(story.pageNumber)
+    ))) throw portablePackageError();
+
+    const { originalSourceOwner: _originalSourceOwner, sourceRevision, sourceIndexedAt, ...portableManifest } = manifest;
+    const hasEmbeddings = chunkRecords.some((chunk) => Boolean(chunk.embedding?.length));
+    replacements.push({
+      manifest: {
+        ...portableManifest,
+        id: documentId,
+        owner: importOwner,
+        revision: sourceRevision ?? `imported:${packageData.exportedAt}:v4`,
+        embeddingStatus: hasEmbeddings ? "ready" : "unavailable",
+        indexedAt: sourceIndexedAt ?? Date.now(),
+        status: "indexed",
+      },
+      pages: pageRecords,
+      chunks: chunkRecords,
+      stories: portable.stories,
+    });
+  }
+  return replacements;
+}
+
+/** Import lexical/page evidence atomically. Embeddings are intentionally rebuilt on this device. */
+export async function importPortableRagPackage(value: unknown, expectedOwner?: string, signal?: AbortSignal): Promise<number> {
+  signal?.throwIfAborted();
+  if (!activeOwner) throw new Error(localize("Connect a wallet before importing a RAG backup.", "Hãy kết nối ví trước khi nhập gói RAG."));
+  const importOwner = (expectedOwner ?? activeOwner).toLowerCase();
+  if (activeOwner !== importOwner) throw new DOMException(localize("The wallet changed; RAG import stopped.", "Ví đã thay đổi; dừng nhập RAG."), "AbortError");
+  if (!isPortableRagPackage(value)) throw new Error(localize("This is not a valid Shelby RAG backup.", "Đây không phải gói Shelby RAG hợp lệ."));
+  const activeIdentity = parseShelbyWorkspaceKey(importOwner);
+  const sourceNetwork = value.version === 2 ? value.sourceNetwork : "testnet";
+  if (sourceNetwork !== activeIdentity.network) {
+    throw new Error(localize(
+      sourceNetwork === "testnet"
+        ? "This Testnet backup is preserved, but it cannot be restored until Testnet reopens."
+        : "This backup belongs to ShelbyNet and cannot be restored in the current workspace.",
+      sourceNetwork === "testnet"
+        ? "Bản sao Testnet vẫn được giữ, nhưng chưa thể khôi phục đến khi Testnet mở lại."
+        : "Bản sao này thuộc ShelbyNet và không thể khôi phục trong workspace hiện tại.",
+    ));
+  }
+  const replacements = preparePortableReplacements(value, importOwner)
+    // A remote capsule can outlive or predate its source policy. Never restore
+    // a document that the latest authoritative Shelby refresh no longer allows.
+    .filter((replacement) => isSourceEligibleInCurrentInventory(replacement.manifest.source));
+  signal?.throwIfAborted();
+  if (!replacements.length) throw new Error(localize("The RAG backup contains no valid documents.", "Gói RAG không có tài liệu hợp lệ để nhập."));
+  await replaceDocuments(replacements, signal);
+  return replacements.length;
+}
+
+/** JSON-equivalent footprint of the active wallet's persisted RAG, including vectors. */
+export async function estimateActiveRagStorageBytes(): Promise<number> {
+  if (!activeOwner) return 0;
+  await ensureContentLoaded();
+  const activeManifests = Array.from(manifests.values());
+  const activePages = Array.from(pages.values());
+  const activeChunks = Array.from(chunks.values());
+  return new Blob([JSON.stringify({ manifests: activeManifests, pages: activePages, chunks: activeChunks, workspace })]).size;
+}
+
+async function keysForDocument(store: IDBObjectStore, documentId: string): Promise<IDBValidKey[]> {
+  return requestValue(store.index("documentId").getAllKeys(documentId));
+}
+
+function emptyWorkspace(owner: string): WorkspaceRecord {
+  return { id: owner, owner, inventory: null, stories: [] };
+}
+
+function workspaceForOwner(value: WorkspaceRecord | null | undefined, owner: string): WorkspaceRecord {
+  return value?.owner === owner && Array.isArray(value.stories) ? value : emptyWorkspace(owner);
+}
+
+async function replaceDocuments(replacements: DocumentReplacement[], signal?: AbortSignal): Promise<void> {
+  signal?.throwIfAborted();
+  if (!replacements.length) return;
+  const commitOwner = replacements[0].manifest.owner.toLowerCase();
+  const replacedSources = new Set<string>();
+  for (const replacement of replacements) {
+    if (replacement.manifest.owner.toLowerCase() !== commitOwner || replacedSources.has(replacement.manifest.source)) {
+      throw new Error(localize("The RAG commit contains conflicting documents.", "Bản ghi RAG chứa tài liệu xung đột."));
+    }
+    replacedSources.add(replacement.manifest.source);
+  }
+  if (!activeOwner || commitOwner !== activeOwner) throw new DOMException("Ví đã thay đổi; dừng commit index.", "AbortError");
+  let nextWorkspace: WorkspaceRecord = {
+    ...workspaceForOwner(workspace, commitOwner),
+    stories: [
+      ...workspaceForOwner(workspace, commitOwner).stories.filter((story) => !replacedSources.has(story.source)),
+      ...replacements.flatMap((replacement) => replacement.stories),
+    ],
+  };
+  const db = await openDatabase();
+  signal?.throwIfAborted();
+  if (activeOwner !== commitOwner) throw new DOMException("Ví đã thay đổi; dừng commit index.", "AbortError");
+  if (db) {
+    const transaction = db.transaction(["manifests", "pages", "chunks", "workspace"], "readwrite");
+    const pageStore = transaction.objectStore("pages");
+    const chunkStore = transaction.objectStore("chunks");
+    const workspaceStore = transaction.objectStore("workspace");
+    const [persistedWorkspace, derivedKeys] = await Promise.all([
+      requestValue(workspaceStore.get(commitOwner)) as Promise<WorkspaceRecord | undefined>,
+      Promise.all(replacements.map(async (replacement) => ({
+        replacement,
+        pageKeys: await keysForDocument(pageStore, replacement.manifest.id),
+        chunkKeys: await keysForDocument(chunkStore, replacement.manifest.id),
+      }))),
+    ]);
+    const latestWorkspace = workspaceForOwner(persistedWorkspace, commitOwner);
+    nextWorkspace = {
+      ...latestWorkspace,
+      stories: [
+        ...latestWorkspace.stories.filter((story) => !replacedSources.has(story.source)),
+        ...replacements.flatMap((replacement) => replacement.stories),
+      ],
+    };
+    signal?.throwIfAborted();
+    if (activeOwner !== commitOwner) {
+      transaction.abort();
+      throw new DOMException("Ví đã thay đổi; dừng commit index.", "AbortError");
+    }
+    derivedKeys.forEach(({ replacement, pageKeys, chunkKeys }) => {
+      pageKeys.forEach((key) => pageStore.delete(key));
+      chunkKeys.forEach((key) => chunkStore.delete(key));
+      replacement.pages.forEach((page) => pageStore.put(page));
+      replacement.chunks.forEach((chunk) => chunkStore.put(chunk));
+      transaction.objectStore("manifests").put(replacement.manifest);
+    });
+    workspaceStore.put(nextWorkspace);
+    await transactionDone(transaction);
+  }
+  if (activeOwner !== commitOwner) throw new DOMException("Ví đã thay đổi; index đã được lưu cho ví cũ nhưng không áp dụng vào phiên mới.", "AbortError");
+  workspace = nextWorkspace;
+  replacements.forEach((replacement) => manifests.set(replacement.manifest.source, replacement.manifest));
+  pages.clear();
+  chunks.clear();
+  contentLoaded = false;
+  lexicalDb = null;
+  queryEmbeddingCache.clear();
+  emitRagState();
+}
+
+export async function replaceDocument(replacement: DocumentReplacement): Promise<void> {
+  await replaceDocuments([replacement]);
+}
+
+export async function updateUserDocumentMetadata(source: string, title: string, aliases: string[]) {
+  const manifest = manifests.get(source);
+  if (!manifest || !activeOwner) return;
+  const expectedOwner = activeOwner;
+  if (manifest.owner.toLowerCase() !== expectedOwner) return;
+  const updated: DocumentManifest = {
+    ...manifest,
+    title: { value: title.trim(), confidence: 1, provenance: "user", userLocked: true },
+    aliases: [...new Set(aliases.map((alias) => alias.trim()).filter(Boolean))],
+    indexedAt: Date.now(),
+  };
+  const db = await openDatabase();
+  if (activeOwner !== expectedOwner) throw new DOMException("Ví đã thay đổi; không áp dụng chỉnh sửa cũ.", "AbortError");
+  if (db) {
+    const transaction = db.transaction("manifests", "readwrite");
+    transaction.objectStore("manifests").put(updated);
+    await transactionDone(transaction);
+  }
+  if (activeOwner !== expectedOwner) return;
+  manifests.set(source, updated);
+  emitRagState();
+}
+
+export async function setShelbyBlobInventory(
+  owner: string,
+  names: string[],
+  eligibleNames: string[] = names,
+  unresolvedNames: string[] = [],
+  shouldApply: () => boolean = () => true,
+): Promise<boolean> {
+  const inventoryOwner = owner.toLowerCase();
+  if (!shouldApply()) return false;
+  const activated = await setActiveRagOwner(inventoryOwner, shouldApply);
+  if (!activated || !shouldApply()) return false;
+  if (activeOwner !== inventoryOwner) throw new DOMException("Ví đã thay đổi; bỏ qua dữ liệu Shelby cũ.", "AbortError");
+  const uniqueNames = [...new Set(names.filter(Boolean))];
+  const knownNames = new Set(uniqueNames);
+  const uniqueEligibleNames = [...new Set(eligibleNames.filter((name) => Boolean(name) && knownNames.has(name)))];
+  const eligible = new Set(uniqueEligibleNames);
+  const uniqueUnresolvedNames = [...new Set(unresolvedNames.filter((name) => knownNames.has(name) && !eligible.has(name)))];
+  const unresolved = new Set(uniqueUnresolvedNames);
+  // Unknown is not revocation: keep its cached bytes but exclude it from search.
+  // A source is deleted only after Shelby no longer lists it or its policy was
+  // positively resolved as ineligible.
+  let removedManifests = Array.from(manifests.values()).filter((manifest) => (
+    !knownNames.has(manifest.source)
+    || (!eligible.has(manifest.source) && !unresolved.has(manifest.source))
+  ));
+  let nextWorkspace: WorkspaceRecord = {
+    id: inventoryOwner,
+    owner: inventoryOwner,
+    inventory: {
+      names: uniqueNames,
+      eligibleNames: uniqueEligibleNames,
+      unresolvedNames: uniqueUnresolvedNames,
+      fetchedAt: Date.now(),
+      verified: uniqueUnresolvedNames.length === 0,
+    },
+    stories: (workspace?.stories ?? []).filter((story) => eligible.has(story.source) || unresolved.has(story.source)),
+  };
+  let persistedManifestsAfterPolicy: DocumentManifest[] | null = null;
+  const db = await openDatabase();
+  if (!shouldApply()) return false;
+  if (activeOwner !== inventoryOwner) throw new DOMException("Ví đã thay đổi; bỏ qua dữ liệu Shelby cũ.", "AbortError");
+  if (db) {
+    // Persist the new authority snapshot and remove derived evidence in one
+    // transaction: export/search can never observe a new policy beside old data.
+    const transaction = db.transaction(["manifests", "pages", "chunks", "workspace"], "readwrite");
+    const manifestStore = transaction.objectStore("manifests");
+    const pageStore = transaction.objectStore("pages");
+    const chunkStore = transaction.objectStore("chunks");
+    const workspaceStore = transaction.objectStore("workspace");
+    const [persistedManifests, persistedWorkspace] = await Promise.all([
+      requestValue(manifestStore.index("owner").getAll(inventoryOwner)) as Promise<DocumentManifest[]>,
+      requestValue(workspaceStore.get(inventoryOwner)) as Promise<WorkspaceRecord | undefined>,
+    ]);
+    removedManifests = persistedManifests.filter((manifest) => (
+      !knownNames.has(manifest.source)
+      || (!eligible.has(manifest.source) && !unresolved.has(manifest.source))
+    ));
+    const removedIds = new Set(removedManifests.map((manifest) => manifest.id));
+    persistedManifestsAfterPolicy = persistedManifests.filter((manifest) => !removedIds.has(manifest.id));
+    const latestWorkspace = workspaceForOwner(persistedWorkspace, inventoryOwner);
+    nextWorkspace = {
+      ...nextWorkspace,
+      stories: latestWorkspace.stories.filter((story) => eligible.has(story.source) || unresolved.has(story.source)),
+    };
+    const derivedKeys = await Promise.all(removedManifests.map(async (manifest) => ({
+      manifest,
+      pageKeys: await keysForDocument(pageStore, manifest.id),
+      chunkKeys: await keysForDocument(chunkStore, manifest.id),
+    })));
+    if (!shouldApply() || activeOwner !== inventoryOwner) {
+      transaction.abort();
+      return false;
+    }
+    derivedKeys.forEach(({ manifest, pageKeys, chunkKeys }) => {
+      pageKeys.forEach((key) => pageStore.delete(key));
+      chunkKeys.forEach((key) => chunkStore.delete(key));
+      manifestStore.delete(manifest.id);
+    });
+    workspaceStore.put(nextWorkspace);
+    await transactionDone(transaction);
+  }
+  if (!shouldApply()) return false;
+  if (activeOwner !== inventoryOwner) throw new DOMException("Ví đã thay đổi; dữ liệu cũ không được áp dụng vào phiên mới.", "AbortError");
+  if (persistedManifestsAfterPolicy) {
+    // Apply the snapshot already read inside the owner-keyed transaction. A
+    // direct asynchronous `loadOwner()` here could race a wallet switch and
+    // hydrate the previous wallet after the new one became active.
+    manifests.clear();
+    persistedManifestsAfterPolicy.forEach((manifest) => manifests.set(manifest.source, manifest));
+    workspace = nextWorkspace;
+  } else {
+    removedManifests.forEach((manifest) => manifests.delete(manifest.source));
+    workspace = nextWorkspace;
+  }
+  pages.clear();
+  chunks.clear();
+  contentLoaded = false;
+  lexicalDb = null;
+  queryEmbeddingCache.clear();
+  emitRagState();
+  return true;
+}
+
+/** Fail closed on an unverified policy refresh without deleting cached bytes. */
+export async function invalidateShelbyBlobInventory(owner: string, shouldApply: () => boolean = () => true): Promise<boolean> {
+  const inventoryOwner = owner.toLowerCase();
+  if (!shouldApply()) return false;
+  const activated = await setActiveRagOwner(inventoryOwner, shouldApply);
+  if (!activated || !shouldApply() || activeOwner !== inventoryOwner) return false;
+  const previous = workspace?.inventory;
+  const nextWorkspace: WorkspaceRecord = {
+    id: inventoryOwner,
+    owner: inventoryOwner,
+    inventory: {
+      names: previous?.names ?? [],
+      eligibleNames: previous?.eligibleNames ?? [],
+      unresolvedNames: previous?.unresolvedNames ?? [],
+      fetchedAt: previous?.fetchedAt ?? 0,
+      verified: false,
+    },
+    stories: workspace?.stories ?? [],
+  };
+  const db = await openDatabase();
+  if (!shouldApply() || activeOwner !== inventoryOwner) return false;
+  if (db) {
+    const transaction = db.transaction("workspace", "readwrite");
+    transaction.objectStore("workspace").put(nextWorkspace);
+    await transactionDone(transaction);
+  }
+  if (!shouldApply() || activeOwner !== inventoryOwner) return false;
+  workspace = nextWorkspace;
+  lexicalDb = null;
+  queryEmbeddingCache.clear();
+  emitRagState();
+  return true;
+}
+
+export function getShelbyBlobInventory() {
+  return workspace?.inventory ? { owner: workspace.owner, ...workspace.inventory } : null;
+}
+
+export function extractStoryEntries(source: string, pageNumber: number, text: string): StoryEntry[] {
+  const output: StoryEntry[] = [];
+  const heading = /\b(\d{1,4})\s*[-.):]\s*([A-ZÀ-Ỵ][A-ZÀ-Ỵ\s,'’ -]{3,100})/g;
+  let match: RegExpExecArray | null;
+  while ((match = heading.exec(text))) {
+    const number = Number(match[1]);
+    const title = match[2].trim().replace(/\s+/g, " ");
+    if (Number.isFinite(number) && /[A-Za-zÀ-ỹ]/.test(title)) output.push({ source, number, title, pageNumber });
+  }
+  return output;
+}
+
+export function getStoryEntries(source?: string): StoryEntry[] {
+  return (workspace?.stories ?? [])
+    .filter((entry) => isSourceEligibleInCurrentInventory(entry.source) && (!source || entry.source === source))
+    .sort((a, b) => a.number - b.number);
+}
+
+function excerptAround(text: string, needle: string): string {
+  const collapsed = text.replace(/\s+/g, " ").trim();
+  const normalized = normalizeSearchText(collapsed);
+  const index = normalized.indexOf(normalizeSearchText(needle));
+  const start = Math.max(0, index < 0 ? 0 : index - 140);
+  return collapsed.slice(start, start + Math.max(needle.length + 280, 420)).trim();
+}
+
+function wordTokenSpans(text: string): Array<{ value: string; start: number; end: number }> {
+  return [...text.matchAll(/[\p{L}\p{N}]+/gu)].map((match) => ({
+    value: normalizeSearchText(match[0]),
+    start: match.index ?? 0,
+    end: (match.index ?? 0) + match[0].length,
+  }));
+}
+
+const MAX_FUZZY_QUOTE_TOKENS = 64;
+const MAX_FUZZY_PAGE_TOKENS = 50_000;
+
+/** Finds the closest contiguous page span in O(query × page), not O(page × query²). */
+function fuzzyTokenSpan(query: string[], page: Array<{ value: string; start: number; end: number }>): { score: number; start: number; end: number } | null {
+  if (!query.length || !page.length) return null;
+  const width = page.length + 1;
+  let previous = new Uint16Array(width);
+  let previousStarts = new Uint32Array(width);
+  for (let column = 0; column < width; column += 1) previousStarts[column] = column;
+
+  for (let row = 1; row <= query.length; row += 1) {
+    const current = new Uint16Array(width);
+    const currentStarts = new Uint32Array(width);
+    current[0] = row;
+    for (let column = 1; column < width; column += 1) {
+      let distance = previous[column - 1] + (query[row - 1] === page[column - 1].value ? 0 : 1);
+      let spanStart = previousStarts[column - 1];
+      const insert = current[column - 1] + 1;
+      if (insert < distance) {
+        distance = insert;
+        spanStart = currentStarts[column - 1];
+      }
+      const remove = previous[column] + 1;
+      if (remove < distance) {
+        distance = remove;
+        spanStart = previousStarts[column];
+      }
+      current[column] = distance;
+      currentStarts[column] = spanStart;
+    }
+    previous = current;
+    previousStarts = currentStarts;
+  }
+
+  let bestColumn = 0;
+  for (let column = 1; column < width; column += 1) {
+    if (!bestColumn || previous[column] < previous[bestColumn]) bestColumn = column;
+  }
+  const tokenStart = previousStarts[bestColumn];
+  if (!bestColumn || tokenStart >= bestColumn || tokenStart >= page.length) return null;
+  const score = 1 - previous[bestColumn] / Math.max(query.length, bestColumn - tokenStart);
+  if (score < 0.82) return null;
+  return { score, start: page[tokenStart].start, end: page[bestColumn - 1].end };
+}
+
+function excerptAroundSpan(text: string, start: number, end: number): string {
+  const excerptStart = Math.max(0, start - 140);
+  const excerptEnd = Math.min(text.length, Math.max(end + 280, excerptStart + 420));
+  return text.slice(excerptStart, excerptEnd).replace(/\s+/g, " ").trim();
+}
+
+export function findExactQuoteInPages(inputPages: PageRecord[], quote: string): RetrievalResult | null {
+  const exactNeedle = normalizeSearchText(quote);
+  if (!exactNeedle) return null;
+  for (const page of inputPages) {
+    if (page.normalizedText.includes(exactNeedle)) {
+      return { method: "exact", documentId: page.documentId, source: page.source, displayName: page.displayName, pageNumber: page.pageNumber, totalPages: page.totalPages, excerpt: excerptAround(page.rawText, quote), score: 1 };
+    }
+  }
+  const queryTokens = wordTokenSpans(quote).map((token) => token.value).filter((token) => token.length > 1);
+  if (queryTokens.length < 3 || queryTokens.length > MAX_FUZZY_QUOTE_TOKENS) return null;
+  let best: { page: PageRecord; score: number; start: number; end: number } | null = null;
+  for (const page of inputPages) {
+    const pageTokens = wordTokenSpans(page.rawText);
+    if (pageTokens.length > MAX_FUZZY_PAGE_TOKENS) continue;
+    const match = fuzzyTokenSpan(queryTokens, pageTokens);
+    if (match && (!best || match.score > best.score)) best = { page, ...match };
+  }
+  if (!best) return null;
+  return { method: "fuzzy", documentId: best.page.documentId, source: best.page.source, displayName: best.page.displayName, pageNumber: best.page.pageNumber, totalPages: best.page.totalPages, excerpt: excerptAroundSpan(best.page.rawText, best.start, best.end), score: best.score };
+}
+
+function withProvenance(result: RetrievalResult, manifest?: DocumentManifest, chunk?: ChunkRecord, page?: PageRecord): RetrievalResult {
+  if (!manifest) return result;
+  const identity = parseShelbyWorkspaceKey(manifest.owner);
+  return {
+    ...result,
+    provenance: {
+      network: identity.network,
+      owner: identity.owner,
+      accessTag: manifest.accessTag,
+      blobId: manifest.blobId,
+      blobMerkleRoot: manifest.blobMerkleRoot,
+      blobSize: manifest.blobSize,
+      blobCreatedAtMicros: manifest.blobCreatedAtMicros,
+      indexedAt: manifest.indexedAt,
+      sourceRevision: manifest.revision,
+      chunkId: chunk?.id,
+      mimeType: manifest.mimeType,
+      pageContentHash: page?.contentHash,
+      chunkContentHash: chunk?.contentHash,
+      extractionMethod: page?.extractionMethod,
+    },
+  };
+}
+
+export async function lookupExactQuote(quote: string, signal?: AbortSignal): Promise<RetrievalResult | null> {
+  signal?.throwIfAborted();
+  await ensureContentLoaded();
+  signal?.throwIfAborted();
+  const indexedDocumentIds = new Set(Array.from(manifests.values()).filter(isSearchableManifest).map((manifest) => manifest.id));
+  const result = findExactQuoteInPages(Array.from(pages.values()).filter((page) => indexedDocumentIds.has(page.documentId)), quote);
+  if (!result) {
+    const remoteResult = await (remoteRagProvider?.lookupExactQuote?.(quote, signal) ?? lookupRemoteExactQuote(quote, signal));
+    return remoteResult && isSourceEligibleInCurrentInventory(remoteResult.source) ? remoteResult : null;
+  }
+  const manifest = Array.from(manifests.values()).find((item) => item.id === result.documentId);
+  const page = pages.get(`${result.documentId}:page:${result.pageNumber}`);
+  const pageChunks = Array.from(chunks.values()).filter((item) => item.documentId === result.documentId && item.pageNumber === result.pageNumber);
+  const normalizedQuote = normalizeSearchText(quote);
+  const chunk = pageChunks.find((item) => item.normalizedText.includes(normalizedQuote))
+    ?? pageChunks.sort((a, b) => tokenCoverage(searchTokens(quote), b.text) - tokenCoverage(searchTokens(quote), a.text))[0];
+  return withProvenance({ ...result, link: manifest?.blobUrl ? `${manifest.blobUrl}#page=${result.pageNumber}` : undefined }, manifest, chunk, page);
+}
+
+async function buildLexicalDb() {
+  if (lexicalDb) return lexicalDb;
+  lexicalDb = await create({ schema: { id: "string", text: "string", normalizedText: "string", source: "string", displayName: "string", type: "string", pageNumber: "number", totalPages: "number", imageUrl: "string" } });
+  for (const chunk of chunks.values()) {
+    const manifest = manifests.get(chunk.source);
+    if (!manifest || !isSearchableManifest(manifest)) continue;
+    await insert(lexicalDb, { id: chunk.id, text: chunk.text, normalizedText: chunk.normalizedText, source: chunk.source, displayName: chunk.displayName, type: chunk.type, pageNumber: chunk.pageNumber, totalPages: chunk.totalPages, imageUrl: chunk.imageUrl ?? "" });
+  }
+  return lexicalDb;
+}
+
+function cosine(a: number[], b: number[]): number {
+  if (!a.length || a.length !== b.length) return 0;
+  let dot = 0;
+  let aa = 0;
+  let bb = 0;
+  for (let index = 0; index < a.length; index += 1) {
+    dot += a[index] * b[index];
+    aa += a[index] ** 2;
+    bb += b[index] ** 2;
+  }
+  return dot / (Math.sqrt(aa) * Math.sqrt(bb) || 1);
+}
+
+function searchTokens(value: string): string[] {
+  const stopWords = new Set(["và", "là", "của", "cho", "trong", "một", "những", "các", "được", "về", "the", "and", "for", "with"]);
+  return normalizeSearchText(value)
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .split(/[^\p{L}\p{N}]+/u)
+    .filter((token) => token.length > 1 && !stopWords.has(token));
+}
+
+function tokenCoverage(queryTokens: string[], text: string): number {
+  if (!queryTokens.length) return 0;
+  const documentTokens = new Set(searchTokens(text));
+  return queryTokens.filter((token) => documentTokens.has(token)).length / queryTokens.length;
+}
+
+function tokenJaccard(a: string, b: string): number {
+  const left = new Set(searchTokens(a));
+  const right = new Set(searchTokens(b));
+  if (!left.size || !right.size) return 0;
+  const intersection = [...left].filter((token) => right.has(token)).length;
+  return intersection / (left.size + right.size - intersection);
+}
+
+async function cachedQueryEmbedding(query: string, provider: EmbeddingProvider, signal?: AbortSignal): Promise<number[]> {
+  signal?.throwIfAborted();
+  if (!getGeminiUsagePreferences().semanticSearch) throw new Error(localize("Semantic search is turned off in Settings.", "Tìm theo ý nghĩa đang tắt trong Cấu hình."));
+  const key = `${provider}:${normalizeSearchText(query)}`;
+  const cached = queryEmbeddingCache.get(key);
+  if (cached) return cached;
+  const [embedding] = await embedTexts([query], "query", undefined, provider, undefined, signal);
+  signal?.throwIfAborted();
+  if (!embedding) throw new Error(localize(`Could not create a query vector with ${provider}.`, `Không tạo được vector câu hỏi từ ${provider}.`));
+  queryEmbeddingCache.set(key, embedding);
+  if (queryEmbeddingCache.size > 24) queryEmbeddingCache.delete(queryEmbeddingCache.keys().next().value!);
+  return embedding;
+}
+
+function remoteDocumentId(owner: string, source: string, network: "shelbynet" | "testnet" = "testnet") {
+  return `shelby:${network}:${owner.toLowerCase()}:${source}`;
+}
+
+function remotePageRecord(packageData: PortableRagPackage, documentId: string, pageNumber: number): PageRecord | undefined {
+  const network = packageData.version === 2 ? packageData.sourceNetwork : "testnet";
+  for (const document of packageData.documents) {
+    const owner = document.manifest.originalSourceOwner || packageData.sourceOwner;
+    if (remoteDocumentId(owner, document.manifest.source, network) !== documentId) continue;
+    const page = document.pages.find((candidate) => candidate.pageNumber === pageNumber);
+    if (!page) return undefined;
+    return { ...page, id: `${documentId}:page:${page.pageNumber}`, owner, documentId };
+  }
+  return undefined;
+}
+
+async function lookupRemoteExactQuote(quote: string, signal?: AbortSignal): Promise<RetrievalResult | null> {
+  const packageData = await getRemoteRagPackage(signal);
+  if (!packageData) return null;
+  const network = packageData.version === 2 ? packageData.sourceNetwork : "testnet";
+  const normalizedQuote = normalizeSearchText(quote);
+  for (const document of packageData.documents) {
+    const owner = document.manifest.originalSourceOwner || packageData.sourceOwner;
+    const documentId = remoteDocumentId(owner, document.manifest.source, network);
+    for (const page of document.pages) {
+      signal?.throwIfAborted();
+      if (!page.normalizedText.includes(normalizedQuote)) continue;
+      const chunkIndex = document.chunks.findIndex((chunk) => chunk.pageNumber === page.pageNumber && chunk.normalizedText.includes(normalizedQuote));
+      const chunk = chunkIndex >= 0 ? document.chunks[chunkIndex] : undefined;
+      const isPublic = document.manifest.accessTag === "public";
+      return {
+        method: "exact", documentId, source: document.manifest.source, displayName: document.manifest.displayName,
+        pageNumber: page.pageNumber, totalPages: page.totalPages, excerpt: excerptAround(page.rawText, quote), score: 1,
+        link: isPublic ? `${getShelbyBlobUrl(owner, document.manifest.source, network)}${page.pageNumber ? `#page=${page.pageNumber}` : ""}` : undefined,
+        provenance: {
+          network, owner, accessTag: document.manifest.accessTag, blobId: document.manifest.blobId,
+          blobMerkleRoot: document.manifest.blobMerkleRoot, blobSize: document.manifest.blobSize,
+          blobCreatedAtMicros: document.manifest.blobCreatedAtMicros,
+          indexedAt: document.manifest.sourceIndexedAt ?? packageData.exportedAt,
+          sourceRevision: document.manifest.sourceRevision ?? `remote:${packageData.exportedAt}`,
+          chunkId: chunk ? `${documentId}:chunk:${chunkIndex}` : undefined,
+          mimeType: document.manifest.mimeType, pageContentHash: page.contentHash,
+          chunkContentHash: chunk?.contentHash, extractionMethod: page.extractionMethod,
+        },
+      };
+    }
+  }
+  return null;
+}
+
+async function searchRemotePortablePackage(query: string, limit: number, signal?: AbortSignal, excludeSources = new Set<string>()): Promise<RetrievalResult[]> {
+  const packageData = await getRemoteRagPackage(signal);
+  if (!packageData) return [];
+  const network = packageData.version === 2 ? packageData.sourceNetwork : "testnet";
+  const queryTokens = searchTokens(query);
+  const normalizedQuery = normalizeSearchText(query);
+  const providers = new Set<EmbeddingProvider>();
+  for (const document of packageData.documents) {
+    if (excludeSources.has(document.manifest.source)) continue;
+    for (const chunk of document.chunks) if (chunk.embedding?.length) providers.add(chunk.embeddingProvider ?? "gemini");
+  }
+  const queryEmbeddings = new Map<EmbeddingProvider, number[]>();
+  await Promise.all(Array.from(providers).map(async (provider) => {
+    try {
+      queryEmbeddings.set(provider, await cachedQueryEmbedding(query, provider, signal));
+    } catch (error) {
+      if (signal?.aborted) throw error;
+      console.warn(`Could not create a ${provider} query vector for the Shelby RAG backup; continuing with keyword search.`, error);
+    }
+  }));
+
+  const candidates: Array<{ result: RetrievalResult; score: number }> = [];
+  for (const document of packageData.documents) {
+    if (excludeSources.has(document.manifest.source) || document.manifest.status !== "indexed") continue;
+    const owner = document.manifest.originalSourceOwner || packageData.sourceOwner;
+    const documentId = remoteDocumentId(owner, document.manifest.source, network);
+    document.chunks.forEach((chunk, chunkIndex) => {
+      const coverage = tokenCoverage(queryTokens, chunk.text);
+      const exact = Boolean(normalizedQuery && chunk.normalizedText.includes(normalizedQuery));
+      const provider = chunk.embeddingProvider ?? "gemini";
+      const queryEmbedding = chunk.embedding?.length ? queryEmbeddings.get(provider) : undefined;
+      const semantic = queryEmbedding && chunk.embedding ? cosine(queryEmbedding, chunk.embedding) : undefined;
+      let score = coverage * 0.42 + (exact ? 0.85 : 0);
+      if (semantic !== undefined) score += 0.5 * Math.max(0, (semantic - 0.2) / 0.8);
+      if (score < 0.12) return;
+      const page = document.pages.find((candidate) => candidate.pageNumber === chunk.pageNumber);
+      const isPublic = document.manifest.accessTag === "public";
+      candidates.push({
+        score,
+        result: {
+          method: semantic !== undefined && (coverage > 0 || exact) ? "hybrid" : semantic !== undefined ? "semantic" : "lexical",
+          documentId, source: document.manifest.source, displayName: document.manifest.displayName,
+          pageNumber: chunk.pageNumber, totalPages: chunk.totalPages, excerpt: chunk.text, score,
+          link: isPublic ? `${getShelbyBlobUrl(owner, document.manifest.source, network)}${chunk.pageNumber ? `#page=${chunk.pageNumber}` : ""}` : undefined,
+          provenance: {
+            network, owner, accessTag: document.manifest.accessTag, blobId: document.manifest.blobId,
+            blobMerkleRoot: document.manifest.blobMerkleRoot, blobSize: document.manifest.blobSize,
+            blobCreatedAtMicros: document.manifest.blobCreatedAtMicros,
+            indexedAt: document.manifest.sourceIndexedAt ?? packageData.exportedAt,
+            sourceRevision: document.manifest.sourceRevision ?? `remote:${packageData.exportedAt}`,
+            chunkId: `${documentId}:chunk:${chunkIndex}`, mimeType: document.manifest.mimeType,
+            pageContentHash: page?.contentHash, chunkContentHash: chunk.contentHash,
+            extractionMethod: page?.extractionMethod,
+          },
+        },
+      });
+    });
+  }
+  const output: RetrievalResult[] = [];
+  const byDocument = new Map<string, number>();
+  for (const candidate of candidates.sort((left, right) => right.score - left.score)) {
+    if ((byDocument.get(candidate.result.documentId) ?? 0) >= 4) continue;
+    if (output.some((item) => item.documentId === candidate.result.documentId && tokenJaccard(item.excerpt, candidate.result.excerpt) >= 0.86)) continue;
+    output.push(candidate.result);
+    byDocument.set(candidate.result.documentId, (byDocument.get(candidate.result.documentId) ?? 0) + 1);
+    if (output.length >= limit) break;
+  }
+  return output;
+}
+
+export async function searchDocuments(query: string, limit = 8, signal?: AbortSignal): Promise<RetrievalResult[]> {
+  signal?.throwIfAborted();
+  await ensureContentLoaded();
+  signal?.throwIfAborted();
+  const db = await buildLexicalDb();
+  signal?.throwIfAborted();
+  const numericTerms = query.match(/\b\d{1,4}\b/g) ?? [];
+  const lexicalResults = await Promise.all([...new Set([...numericTerms, query])].map((term) => search(db, { term, properties: ["text", "normalizedText"], limit: Math.max(limit * 2, 16), tolerance: term === query ? 1 : 0 })));
+  signal?.throwIfAborted();
+  const lexical = new Map<string, { score: number; rank: number }>();
+  lexicalResults.forEach((result) => result.hits.forEach((hit: any, rank: number) => {
+    const id = String(hit.document.id);
+    const previous = lexical.get(id);
+    const score = Number(hit.score ?? 0);
+    if (!previous || rank < previous.rank || score > previous.score) lexical.set(id, { rank, score });
+  }));
+
+  const semantic = new Map<string, number>();
+  const providers = new Set<EmbeddingProvider>();
+  for (const chunk of chunks.values()) {
+    const manifest = manifests.get(chunk.source);
+    if (manifest && isSearchableManifest(manifest) && chunk.embedding?.length) providers.add(chunk.embeddingProvider ?? "gemini");
+  }
+  await Promise.all(Array.from(providers).map(async (provider) => {
+    try {
+      const queryEmbedding = await cachedQueryEmbedding(query, provider, signal);
+      signal?.throwIfAborted();
+      for (const chunk of chunks.values()) {
+        const manifest = manifests.get(chunk.source);
+        if (!manifest || !isSearchableManifest(manifest)) continue;
+        if (!chunk.embedding?.length || (chunk.embeddingProvider ?? "gemini") !== provider) continue;
+        semantic.set(chunk.id, Math.max(semantic.get(chunk.id) ?? -1, cosine(queryEmbedding, chunk.embedding)));
+      }
+    } catch (error) {
+      if (signal?.aborted) throw error;
+      console.warn(`${provider} query vectors unavailable; continuing with keyword search.`, error);
+    }
+  }));
+  signal?.throwIfAborted();
+
+  const scores = new Map<string, number>();
+  const normalizedQuery = normalizeSearchText(query);
+  const queryTokens = searchTokens(query);
+  const maxLexicalScore = Math.max(1, ...Array.from(lexical.values()).map((item) => item.score));
+  for (const chunk of chunks.values()) {
+    const manifest = manifests.get(chunk.source);
+    if (!manifest || !isSearchableManifest(manifest)) continue;
+    const lexicalHit = lexical.get(chunk.id);
+    const semanticScore = semantic.get(chunk.id);
+    let score = lexicalHit ? 0.36 * (lexicalHit.score / maxLexicalScore) + 0.12 / (1 + lexicalHit.rank) : 0;
+    if (semanticScore !== undefined) score += 0.46 * Math.max(0, (semanticScore - 0.2) / 0.8);
+    score += 0.2 * tokenCoverage(queryTokens, chunk.text);
+    if (chunk.normalizedText.includes(normalizedQuery)) score += 0.85;
+    if ([manifest?.title?.value, ...(manifest?.aliases ?? [])].some((value) => value && normalizedQuery.includes(normalizeSearchText(value)))) score += 0.22;
+    if (score > 0.03) scores.set(chunk.id, score);
+  }
+
+  const ranked = [...scores.entries()].sort((a, b) => b[1] - a[1]);
+  const selected: Array<[string, number]> = [];
+  const byDocument = new Map<string, number>();
+  const byPage = new Map<string, number>();
+  const minimumScore = Math.max(0.16, (ranked[0]?.[1] ?? 0) * 0.22);
+  for (const candidate of ranked) {
+    if (candidate[1] < minimumScore) break;
+    const chunk = chunks.get(candidate[0]);
+    if (!chunk) continue;
+    const pageKey = `${chunk.documentId}:${chunk.pageNumber}`;
+    if ((byDocument.get(chunk.documentId) ?? 0) >= 4 || (byPage.get(pageKey) ?? 0) >= 2) continue;
+    const isNearDuplicate = selected.some(([selectedId]) => {
+      const previous = chunks.get(selectedId);
+      return previous?.documentId === chunk.documentId && tokenJaccard(previous.text, chunk.text) >= 0.86;
+    });
+    if (isNearDuplicate) continue;
+    selected.push(candidate);
+    byDocument.set(chunk.documentId, (byDocument.get(chunk.documentId) ?? 0) + 1);
+    byPage.set(pageKey, (byPage.get(pageKey) ?? 0) + 1);
+    if (selected.length >= limit) break;
+  }
+
+  const localResults = selected.flatMap(([id, score]) => {
+    const chunk = chunks.get(id);
+    const manifest = chunk ? manifests.get(chunk.source) : undefined;
+    if (!chunk) return [];
+
+    // Resolve permanent Shelby URL if blob is public, fallback to chunk's stored image URL
+    let imageUrl = chunk.imageUrl;
+    if (chunk.type === "image" && manifest && manifest.accessTag === "public" && activeOwner) {
+      const identity = parseShelbyWorkspaceKey(activeOwner);
+      imageUrl = getShelbyBlobUrl(identity.owner, chunk.source, identity.network);
+    }
+
+    const page = pages.get(`${chunk.documentId}:page:${chunk.pageNumber}`);
+    return [withProvenance({ method: lexical.has(id) && semantic.has(id) ? "hybrid" as const : semantic.has(id) ? "semantic" as const : "lexical" as const, documentId: chunk.documentId, source: chunk.source, displayName: chunk.displayName, pageNumber: chunk.pageNumber, totalPages: chunk.totalPages, excerpt: chunk.text, score, imageUrl, link: manifest?.blobUrl ? `${manifest.blobUrl}${chunk.pageNumber ? `#page=${chunk.pageNumber}` : ""}` : undefined }, manifest, chunk, page)];
+  });
+  const indexedLocalSources = new Set(Array.from(manifests.values()).filter(isSearchableManifest).map((manifest) => manifest.source));
+  // A full local result list may still contain weak matches. Always give the
+  // Shelby snapshot the same retrieval budget, then rank both pools together.
+  let remoteResults: RetrievalResult[] = [];
+  try {
+    remoteResults = remoteRagProvider?.search
+      ? await remoteRagProvider.search(query, limit, signal, indexedLocalSources)
+      : await searchRemotePortablePackage(query, limit, signal, indexedLocalSources);
+  } catch (error) {
+    if (signal?.aborted || (error instanceof DOMException && error.name === "AbortError")) throw error;
+    if (!localResults.length) throw error;
+    console.warn("Could not read the Shelby RAG backup; continuing with on-device data.", error);
+  }
+  signal?.throwIfAborted();
+  const deduplicated = new Map<string, RetrievalResult>();
+  for (const result of [...localResults, ...remoteResults.filter((item) => isSourceEligibleInCurrentInventory(item.source))]) {
+    const key = result.provenance?.chunkContentHash
+      ?? result.provenance?.chunkId
+      ?? `${result.source}:${result.pageNumber}:${normalizeSearchText(result.excerpt).slice(0, 160)}`;
+    const previous = deduplicated.get(key);
+    if (!previous || result.score > previous.score) deduplicated.set(key, result);
+  }
+  return [...deduplicated.values()].sort((left, right) => right.score - left.score).slice(0, limit);
+}
+
+export function getImageUrls(): { source: string; url: string }[] {
+  const identity = activeOwner ? parseShelbyWorkspaceKey(activeOwner) : null;
+  return Array.from(manifests.values())
+    .filter((manifest) => manifest.type === "image" && isSearchableManifest(manifest))
+    .map((manifest) => {
+      const url = (manifest.accessTag === "public" && identity)
+        ? getShelbyBlobUrl(identity.owner, manifest.source, identity.network)
+        : manifest.blobUrl;
+      return { source: manifest.source, url: url || "" };
+    })
+    .filter((item) => Boolean(item.url));
+}
+
+export interface ImageDocument {
+  owner: string;
+  source: string;
+  displayName: string;
+  url: string;
+  revision: string;
+  description?: string;
+}
+
+export async function getImageDocuments(): Promise<ImageDocument[]> {
+  await ensureContentLoaded();
+  const identity = activeOwner ? parseShelbyWorkspaceKey(activeOwner) : null;
+  return Array.from(manifests.values())
+    .filter((manifest) => manifest.type === "image" && isSearchableManifest(manifest))
+    .map((manifest) => {
+      const chunk = Array.from(chunks.values()).find((item) => item.documentId === manifest.id && item.type === "image");
+      const text = chunk?.text ?? "";
+      const description = text.match(/(?:AI description|Mô tả AI):\s*([\s\S]+)/i)?.[1]?.trim();
+      const url = (manifest.accessTag === "public" && identity)
+        ? getShelbyBlobUrl(identity.owner, manifest.source, identity.network)
+        : manifest.blobUrl;
+      return { owner: manifest.owner, source: manifest.source, displayName: manifest.displayName, url: url || "", revision: manifest.revision, description };
+    })
+    .filter((item) => Boolean(item.url));
+}
+
+export async function updateImageDescription(source: string, description: string) {
+  await ensureContentLoaded();
+  const updateOwner = activeOwner;
+  if (!updateOwner) return;
+  const manifest = manifests.get(source);
+  if (!manifest || manifest.owner !== updateOwner || !isSearchableManifest(manifest)) return;
+  const existing = manifest && Array.from(chunks.values()).find((chunk) => chunk.documentId === manifest.id && chunk.type === "image");
+  if (!existing) return;
+  const text = `[Image]\nFile name: ${manifest.displayName}\n\nAI description: ${description.trim()}`;
+  const normalizedText = normalizeSearchText(text);
+  const updated: ChunkRecord = {
+    ...existing,
+    text,
+    normalizedText,
+    contentHash: await sha256Text(normalizedText),
+    embedding: undefined,
+    embeddingProvider: undefined,
+  };
+  const updatedManifest: DocumentManifest = {
+    ...manifest,
+    indexedAt: Date.now(),
+    embeddingStatus: "unavailable",
+    embeddingProvider: undefined,
+  };
+  if (activeOwner !== updateOwner) throw new DOMException(localize("The wallet changed; image update stopped.", "Ví đã thay đổi; dừng cập nhật ảnh."), "AbortError");
+  const db = await openDatabase();
+  if (activeOwner !== updateOwner) throw new DOMException(localize("The wallet changed; image update stopped.", "Ví đã thay đổi; dừng cập nhật ảnh."), "AbortError");
+  if (db) {
+    const transaction = db.transaction(["chunks", "manifests"], "readwrite");
+    transaction.objectStore("chunks").put(updated);
+    transaction.objectStore("manifests").put(updatedManifest);
+    await transactionDone(transaction);
+  }
+  if (activeOwner !== updateOwner) throw new DOMException(localize(
+    "The wallet changed; the description was saved for the previous wallet and was not applied here.",
+    "Ví đã thay đổi; mô tả được lưu cho ví cũ nhưng không áp dụng vào phiên mới.",
+  ), "AbortError");
+  chunks.set(updated.id, updated);
+  manifests.set(updatedManifest.source, updatedManifest);
+  lexicalDb = null;
+  queryEmbeddingCache.clear();
+  emitRagState();
+}
+
+type RagSourceFailureInput = Omit<RagSource, "status" | "chunks" | "indexedAt" | "aliases" | "authors" | "ocrCoverage" | "embeddingStatus" | "revision"> & { revision?: string };
+
+export async function recordSourceFailure(source: RagSourceFailureInput, error: unknown, expectedOwner?: string) {
+  if (!activeOwner) return;
+  const failureOwner = (expectedOwner ?? activeOwner).toLowerCase();
+  if (activeOwner !== failureOwner) return;
+  const message = error instanceof Error ? error.message : String(error);
+  const previous = manifests.get(source.source);
+  if (previous) {
+    const attemptedRevision = source.revision ?? previous.revision;
+    const canKeepLastGood = previous.status === "indexed"
+      && sourceContentIdentity(previous.revision) !== ""
+      && sourceContentIdentity(previous.revision) === sourceContentIdentity(attemptedRevision);
+    const updated = {
+      ...previous,
+      ...(canKeepLastGood ? {} : {
+        revision: attemptedRevision,
+        status: "failed" as const,
+        error: localize(`Latest processing attempt failed: ${message}`, `Lần nạp gần nhất lỗi: ${message}`),
+        indexedAt: Date.now(),
+      }),
+      lastAttemptAt: Date.now(),
+      lastAttemptRevision: attemptedRevision,
+      lastAttemptError: localize(`Latest processing attempt failed: ${message}`, `Lần nạp gần nhất lỗi: ${message}`),
+    };
+    const db = await openDatabase();
+    if (db) { const tx = db.transaction("manifests", "readwrite"); tx.objectStore("manifests").put(updated); await transactionDone(tx); }
+    if (activeOwner !== failureOwner) return;
+    manifests.set(source.source, updated);
+    lexicalDb = null;
+    emitRagState();
+    return;
+  }
+  const manifest: DocumentManifest = { id: `${failureOwner}:${source.source}`, owner: failureOwner, source: source.source, displayName: source.displayName, revision: source.revision ?? "failed", blobUrl: source.blobUrl, mimeType: source.type === "image" ? "image/*" : source.type === "video" ? "video/mp4" : "application/octet-stream", type: source.type, aliases: [], authors: [], pageCount: 0, chunkCount: 0, ocrCoverage: 0, embeddingStatus: "unavailable", status: "failed", indexedAt: Date.now(), error: message };
+  const db = await openDatabase();
+  if (db) { const tx = db.transaction("manifests", "readwrite"); tx.objectStore("manifests").put(manifest); await transactionDone(tx); }
+  if (activeOwner !== failureOwner) return;
+  manifests.set(source.source, manifest);
+  emitRagState();
+}
+
+export async function recordSourceSkipped(source: RagSourceFailureInput, reason: string, expectedOwner?: string) {
+  const skipOwner = (expectedOwner ?? activeOwner)?.toLowerCase();
+  if (!skipOwner) return;
+  await recordSourceFailure(source, reason, expectedOwner);
+  if (activeOwner !== skipOwner) return;
+  const manifest = manifests.get(source.source);
+  // `recordSourceFailure` deliberately preserves a same-content last-good
+  // index. A missing parser in the latest attempt must not turn that usable
+  // evidence into a skipped document.
+  if (manifest && manifest.status !== "indexed") {
+    const updated = { ...manifest, status: "skipped" as const };
+    const db = await openDatabase();
+    if (db) { const tx = db.transaction("manifests", "readwrite"); tx.objectStore("manifests").put(updated); await transactionDone(tx); }
+    if (activeOwner !== skipOwner) return;
+    manifests.set(source.source, updated);
+    emitRagState();
+  }
+}
+
+export async function resetRagSource(source: string) {
+  const resetOwner = activeOwner;
+  if (!resetOwner) return;
+  const manifest = manifests.get(source);
+  if (!manifest || manifest.owner !== resetOwner) return;
+  const db = await openDatabase();
+  if (db) {
+    const tx = db.transaction(["manifests", "pages", "chunks"], "readwrite");
+    const pageStore = tx.objectStore("pages");
+    const chunkStore = tx.objectStore("chunks");
+    (await keysForDocument(pageStore, manifest.id)).forEach((key) => pageStore.delete(key));
+    (await keysForDocument(chunkStore, manifest.id)).forEach((key) => chunkStore.delete(key));
+    tx.objectStore("manifests").delete(manifest.id);
+    await transactionDone(tx);
+  }
+  if (activeOwner !== resetOwner) return;
+  manifests.delete(source);
+  pages.clear();
+  chunks.clear();
+  contentLoaded = false;
+  lexicalDb = null;
+  emitRagState();
+}
+
+/**
+ * Removes only the active wallet's browser-side RAG state. Shelby blobs and
+ * every other wallet's workspace are intentionally untouched.
+ */
+export async function clearActiveRagWorkspace(expectedOwner = activeOwner) {
+  if (!expectedOwner || activeOwner !== expectedOwner) return false;
+  const owner = expectedOwner;
+  const db = await openDatabase();
+  if (db) {
+    const transaction = db.transaction(["manifests", "pages", "chunks", "workspace"], "readwrite");
+    const deleteOwnerRecords = async (storeName: "manifests" | "pages" | "chunks") => {
+      const store = transaction.objectStore(storeName);
+      const keys = await requestValue(store.index("owner").getAllKeys(owner));
+      keys.forEach((key) => store.delete(key));
+    };
+    await Promise.all([deleteOwnerRecords("manifests"), deleteOwnerRecords("pages"), deleteOwnerRecords("chunks")]);
+    transaction.objectStore("workspace").delete(owner);
+    await transactionDone(transaction);
+  }
+  if (activeOwner !== owner) return false;
+  manifests.clear();
+  pages.clear();
+  chunks.clear();
+  workspace = null;
+  lexicalDb = null;
+  contentLoaded = false;
+  queryEmbeddingCache.clear();
+  emitRagState();
+  return true;
+}
+
+/** Releases hydrated page/chunk/BM25 data while keeping IndexedDB intact. */
+export function ejectRagRuntime() {
+  pages.clear();
+  chunks.clear();
+  lexicalDb = null;
+  queryEmbeddingCache.clear();
+  contentLoaded = false;
+}
+
+export function getPageRecord(documentId: string, pageNumber: number): PageRecord | undefined {
+  const localPage = pages.get(`${documentId}:page:${pageNumber}`);
+  if (localPage && isSourceEligibleInCurrentInventory(localPage.source)) return localPage;
+  const remotePage = remoteRagProvider?.getPageRecord?.(documentId, pageNumber)
+    ?? (remoteRagCache ? remotePageRecord(remoteRagCache.packageData, documentId, pageNumber) : undefined);
+  return remotePage && isSourceEligibleInCurrentInventory(remotePage.source) ? remotePage : undefined;
+}
+
+export async function flushVectorDB() { /* v4 writes are transactionally flushed. */ }
